@@ -21,6 +21,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/alecthomas/kingpin/v2"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -32,6 +33,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
+	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promlog"
@@ -39,11 +41,11 @@ import (
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/exporter-toolkit/web"
 	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
+	"github.com/prometheus/prometheus/discovery"
 	"github.com/prometheus/prometheus/discovery/refresh"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/documentation/examples/custom-sd/adapter"
 	"github.com/prometheus/prometheus/util/strutil"
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
 
 const (
@@ -65,6 +67,20 @@ const (
 	ecLabelTag                     = ecLabel + "tag_"
 )
 
+type elasticacheMetrics struct {
+	refreshMetrics discovery.RefreshMetricsInstantiator
+}
+
+var _ discovery.DiscovererMetrics = (*elasticacheMetrics)(nil)
+
+// Register implements discovery.DiscovererMetrics.
+func (m *elasticacheMetrics) Register() error {
+	return nil
+}
+
+// Unregister implements discovery.DiscovererMetrics.
+func (m *elasticacheMetrics) Unregister() {}
+
 // ElasticacheSDConfig is the configuration for ElastiCache-based service discovery.
 type ElasticacheSDConfig struct {
 	Region                                  string
@@ -75,6 +91,21 @@ type ElasticacheSDConfig struct {
 	cacheClusterID                          string
 	showCacheClustersNotInReplicationGroups bool
 	RefreshInterval                         time.Duration
+}
+
+// Name returns the name of the Elasticache Config.
+func (*ElasticacheSDConfig) Name() string { return "elasticache" }
+
+// NewDiscoverer returns a Discoverer for the Elasticache Config.
+func (c *ElasticacheSDConfig) NewDiscoverer(opts discovery.DiscovererOptions) (discovery.Discoverer, error) {
+	return NewElasticacheDiscovery(c, opts.Logger, opts.Metrics)
+}
+
+// NewDiscovererMetrics implements discovery.Config.
+func (*ElasticacheSDConfig) NewDiscovererMetrics(_ prometheus.Registerer, rmi discovery.RefreshMetricsInstantiator) discovery.DiscovererMetrics {
+	return &elasticacheMetrics{
+		refreshMetrics: rmi,
+	}
 }
 
 // ElasticacheDiscovery periodically performs Elasticache-SD requests. It implements
@@ -89,7 +120,12 @@ type ElasticacheDiscovery struct {
 }
 
 // NewElasticacheDiscovery returns a new ElasticacheDiscovery which periodically refreshes its targets.
-func NewElasticacheDiscovery(conf *ElasticacheSDConfig, logger log.Logger) *ElasticacheDiscovery {
+func NewElasticacheDiscovery(conf *ElasticacheSDConfig, logger log.Logger, metrics discovery.DiscovererMetrics) (*ElasticacheDiscovery, error) {
+	m, ok := metrics.(*elasticacheMetrics)
+	if !ok {
+		return nil, fmt.Errorf("invalid discovery metrics type")
+	}
+
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -100,13 +136,16 @@ func NewElasticacheDiscovery(conf *ElasticacheSDConfig, logger log.Logger) *Elas
 	}
 
 	d.Discovery = refresh.NewDiscovery(
-		logger,
-		"elasticache",
-		time.Duration(d.cfg.RefreshInterval),
-		d.refresh,
+		refresh.Options{
+			Logger:              logger,
+			Mech:                "elasticache",
+			Interval:            time.Duration(d.cfg.RefreshInterval),
+			RefreshF:            d.refresh,
+			MetricsInstantiator: m.refreshMetrics,
+		},
 	)
 
-	return d
+	return d, nil
 }
 
 func (d *ElasticacheDiscovery) elasticacheClient(ctx context.Context) (*elasticache.Client, error) {
@@ -198,8 +237,8 @@ func (d *ElasticacheDiscovery) refresh(ctx context.Context) ([]*targetgroup.Grou
 				// its tags are unavailable, so if the relabeling logic depends on `__meta_elasticache_tag_<tagkey>` labels,
 				// the clusters may disappear from the Prometheus targets when that happens,
 				// thus we try to reuse the last tags we know about.
-				if _, ok := d.lastTags[*cc.ARN]; !ok {
-					level.Warn(d.logger).Log("msg", "reusing last known tags", "err", err.Error(), "ARN", *cc.ARN)
+				if _, ok := d.lastTags[*cc.ARN]; ok {
+					level.Warn(d.logger).Log("msg", "reusing last known tags", "ARN", *cc.ARN)
 					tags = d.lastTags[*cc.ARN]
 				}
 			} else {
@@ -286,7 +325,7 @@ func main() {
 	level.Info(logger).Log("msg", "Starting prometheus-elasticache-sd", "version", version.Info())
 	level.Info(logger).Log("msg", "Build context", "context", version.BuildContext())
 
-	d := NewElasticacheDiscovery(&ElasticacheSDConfig{
+	conf := &ElasticacheSDConfig{
 		Region:                                  *awsRegion,
 		AccessKey:                               *awsAccessKey,
 		SecretKey:                               *awsSecretKey,
@@ -295,24 +334,55 @@ func main() {
 		cacheClusterID:                          *ecCacheClusterID,
 		showCacheClustersNotInReplicationGroups: *ecShowCacheClustersNotInReplicationGroups,
 		RefreshInterval:                         *targetRefreshInterval,
-	}, logger)
+	}
+	discovery.RegisterConfig(conf)
+
+	reg := prometheus.NewRegistry()
+	refreshMetrics := discovery.NewRefreshMetrics(reg)
+	metrics, err := discovery.RegisterSDMetrics(reg, refreshMetrics)
+	if err != nil {
+		level.Error(logger).Log("msg", "failed to register service discovery metrics", "err", err)
+		os.Exit(1)
+	}
+
+	discMetrics, ok := metrics[conf.Name()]
+	if !ok {
+		level.Error(logger).Log("msg", "discoverer metrics not registered")
+		os.Exit(1)
+	}
+
+	disc, err := conf.NewDiscoverer(discovery.DiscovererOptions{
+		Logger:  logger,
+		Metrics: discMetrics,
+	})
+	if err != nil {
+		level.Error(logger).Log("msg", "failed to instantiate discoverer", "err", err)
+		os.Exit(1)
+	}
 	ctx := context.Background()
 
-	sdAdapter := adapter.NewAdapter(ctx, *outputFile, "elasticache_sd", d, logger)
+	sdAdapter := adapter.NewAdapter(ctx, *outputFile, "elasticache_sd", disc, logger, metrics, reg)
 	sdAdapter.Run()
 
-	prometheus.MustRegister(version.NewCollector("prometheus_elasticache_sd"))
+	prometheus.MustRegister(versioncollector.NewCollector("prometheus_elasticache_sd"))
 
 	http.Handle(*metricsPath, promhttp.Handler())
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<html>
-             <head><title>Prometheus ElastiCache Service Discovery</title></head>
-             <body>
-             <h1>Prometheus ElastiCache Service Discovery</h1>
-             <p><a href='` + *metricsPath + `'>Metrics</a></p>
-             </body>
-             </html>`))
+	landingPage, err := web.NewLandingPage(web.LandingConfig{
+		Name:        "ElastiCache Service Discovery",
+		Description: "Prometheus ElastiCache Service Discovery",
+		Version:     version.Info(),
+		Links: []web.LandingLinks{
+			{
+				Address: *metricsPath,
+				Text:    "Metrics",
+			},
+		},
 	})
+	if err != nil {
+		level.Error(logger).Log("msg", "Error instantiating landing page", "err", err)
+		os.Exit(1)
+	}
+	http.Handle("/", landingPage)
 
 	srv := &http.Server{}
 

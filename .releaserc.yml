@@ -23,6 +23,8 @@ plugins:
         chore(release): v${nextRelease.version} [skip ci]
 
         ${nextRelease.notes}
+  - - "@semantic-release/exec"
+    - publishCmd: goreleaser release --clean
 preset: conventionalcommits
 presetConfig:
   types:
