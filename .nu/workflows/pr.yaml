@@ -1,0 +1,11 @@
+apiVersion: workflows.dev/v1alpha1
+kind: TemplateInstance
+metadata:
+  namespace: pipelines
+spec:
+  templateName: go-service-pr
+  input:
+    goVersion: "122"
+    buildResources:
+      cpu: 2
+      memory: 4Gi
