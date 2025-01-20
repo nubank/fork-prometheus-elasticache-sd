@@ -2,6 +2,9 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.0.367-2 (2025-01-20)
+* Fix exposed cluster port.
+
 ## 1.0.367-1 (2025-01-20)
 * Adding support for `elasticache.cache-cluster-id-pattern` which can filter by using a regex the EC clusters to be exposed.
 
