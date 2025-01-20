@@ -216,7 +216,7 @@ func (d *ElasticacheDiscovery) refresh(ctx context.Context) ([]*targetgroup.Grou
 			stringMatch, _ := d.cfg.cacheClusterIDPattern.MatchString(*cc.CacheClusterId)
 
 			if d.cfg.cacheClusterIDPattern != nil && !stringMatch {
-				continue
+				level.Info(d.logger).Log("msg", "skipping cluster", "cluster", *cc.CacheClusterId)
 			}
 
 			labels := model.LabelSet{
@@ -236,6 +236,7 @@ func (d *ElasticacheDiscovery) refresh(ctx context.Context) ([]*targetgroup.Grou
 
 			tags := []types.Tag{}
 
+			level.Info(d.logger).Log("msg", "fetching tags for cluster", "cluster", *cc.CacheClusterId)
 			to, err := elasticacheClient.ListTagsForResource(ctx, &elasticache.ListTagsForResourceInput{
 				ResourceName: cc.ARN,
 			})
