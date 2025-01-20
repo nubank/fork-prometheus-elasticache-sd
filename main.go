@@ -217,6 +217,7 @@ func (d *ElasticacheDiscovery) refresh(ctx context.Context) ([]*targetgroup.Grou
 
 			if d.cfg.cacheClusterIDPattern != nil && !stringMatch {
 				level.Info(d.logger).Log("msg", "skipping cluster", "cluster", *cc.CacheClusterId)
+				continue
 			}
 
 			labels := model.LabelSet{
