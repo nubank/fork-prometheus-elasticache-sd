@@ -30,6 +30,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/elasticache/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
+	"github.com/dlclark/regexp2"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
@@ -89,6 +90,7 @@ type ElasticacheSDConfig struct {
 	Profile                                 string
 	RoleARN                                 string
 	cacheClusterID                          string
+	cacheClusterIDPattern                   *regexp2.Regexp
 	showCacheClustersNotInReplicationGroups bool
 	RefreshInterval                         time.Duration
 }
@@ -210,6 +212,13 @@ func (d *ElasticacheDiscovery) refresh(ctx context.Context) ([]*targetgroup.Grou
 		}
 
 		for _, cc := range o.CacheClusters {
+
+			stringMatch, _ := d.cfg.cacheClusterIDPattern.MatchString(*cc.CacheClusterId)
+
+			if d.cfg.cacheClusterIDPattern != nil && !stringMatch {
+				continue
+			}
+
 			labels := model.LabelSet{
 				model.LabelName(ecLabelCacheClusterID):          model.LabelValue(*cc.CacheClusterId),
 				model.LabelName(ecLabelCacheClusterStatus):      model.LabelValue(*cc.CacheClusterStatus),
@@ -311,6 +320,7 @@ func main() {
 		outputFile                                = kingpin.Flag("output.file", "The output filename for file_sd compatible file.").Default("elasticache.json").String()
 		webConfig                                 = webflag.AddFlags(kingpin.CommandLine, ":8888")
 		metricsPath                               = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
+		ecCacheClusterIDPattern                   = kingpin.Flag("elasticache.cache-cluster-id-pattern", "Pattern of the CacheClusterID that should be included.").String()
 	)
 
 	promlogConfig := &promlog.Config{}
@@ -325,6 +335,17 @@ func main() {
 	level.Info(logger).Log("msg", "Starting prometheus-elasticache-sd", "version", version.Info())
 	level.Info(logger).Log("msg", "Build context", "context", version.BuildContext())
 
+	var cacheClusterIDPattern *regexp2.Regexp
+	var err error
+
+	if ecCacheClusterIDPattern != nil {
+		cacheClusterIDPattern, err = regexp2.Compile(*ecCacheClusterIDPattern, 0)
+		if err != nil {
+			level.Error(logger).Log("msg", "could not compile elasticache.cache-cluster-id-pattern", "err", err)
+			os.Exit(1)
+		}
+	}
+
 	conf := &ElasticacheSDConfig{
 		Region:                                  *awsRegion,
 		AccessKey:                               *awsAccessKey,
@@ -332,6 +353,7 @@ func main() {
 		Profile:                                 *awsProfile,
 		RoleARN:                                 *awsRoleARN,
 		cacheClusterID:                          *ecCacheClusterID,
+		cacheClusterIDPattern:                   cacheClusterIDPattern,
 		showCacheClustersNotInReplicationGroups: *ecShowCacheClustersNotInReplicationGroups,
 		RefreshInterval:                         *targetRefreshInterval,
 	}
