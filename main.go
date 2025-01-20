@@ -213,11 +213,11 @@ func (d *ElasticacheDiscovery) refresh(ctx context.Context) ([]*targetgroup.Grou
 
 		for _, cc := range o.CacheClusters {
 
-			stringMatch, _ := d.cfg.cacheClusterIDPattern.MatchString(*cc.CacheClusterId)
-
-			if d.cfg.cacheClusterIDPattern != nil && !stringMatch {
-				level.Info(d.logger).Log("msg", "skipping cluster", "cluster", *cc.CacheClusterId)
-				continue
+			if d.cfg.cacheClusterIDPattern != nil {
+				if stringMatch, _ := d.cfg.cacheClusterIDPattern.MatchString(*cc.CacheClusterId); !stringMatch {
+					level.Info(d.logger).Log("msg", "skipping cluster", "cluster", *cc.CacheClusterId)
+					continue
+				}
 			}
 
 			labels := model.LabelSet{
@@ -346,6 +346,7 @@ func main() {
 			level.Error(logger).Log("msg", "could not compile elasticache.cache-cluster-id-pattern", "err", err)
 			os.Exit(1)
 		}
+		level.Info(logger).Log("msg", "regex compiled", "regex", *ecCacheClusterIDPattern)
 	}
 
 	conf := &ElasticacheSDConfig{
