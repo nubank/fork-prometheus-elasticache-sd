@@ -2,6 +2,9 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.0.367-1 (2025-01-20)
+* Adding support for `elasticache.cache-cluster-id-pattern` which can filter by using a regex the EC clusters to be exposed.
+
 ## [1.0.367](https://github.com/maxbrunet/prometheus-elasticache-sd/compare/v1.0.366...v1.0.367) (2024-12-26)
 
 ### Miscellaneous Chores

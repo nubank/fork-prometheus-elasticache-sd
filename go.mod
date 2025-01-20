@@ -2,7 +2,7 @@ module github.com/maxbrunet/prometheus-elasticache-sd
 
 go 1.22.0
 
-toolchain go1.23.4
+toolchain go1.23.1
 
 require (
 	github.com/alecthomas/kingpin/v2 v2.4.0
@@ -32,6 +32,7 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/coreos/go-systemd/v22 v22.5.0 // indirect
+	github.com/dlclark/regexp2 v1.11.4 // indirect
 	github.com/go-logfmt/logfmt v0.6.0 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/grafana/regexp v0.0.0-20240518133315-a468a5bfb3bc // indirect
