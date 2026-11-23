@@ -1,8 +1,10 @@
+> ⚠️ **ARCHIVED**: Built-in AWS ElastiCache SD is available since Prometheus [v3.11.0](https://github.com/prometheus/prometheus/releases/v3.11.0).
+> Please see the [official documentation](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#elasticache) for details
+
 # Prometheus AWS ElastiCache Service Discovery
 
 [![release](https://img.shields.io/github/v/release/maxbrunet/prometheus-elasticache-sd?sort=semver)](https://github.com/maxbrunet/prometheus-elasticache-sd/releases)
 [![build](https://github.com/maxbrunet/prometheus-elasticache-sd/actions/workflows/build.yml/badge.svg)](https://github.com/maxbrunet/prometheus-elasticache-sd/actions/workflows/build.yml)
-[![go report](https://goreportcard.com/badge/github.com/maxbrunet/prometheus-elasticache-sd)](https://goreportcard.com/report/github.com/maxbrunet/prometheus-elasticache-sd)
 
 ElastiCache SD allows retrieving scrape targets from [AWS ElastiCache](https://aws.amazon.com/elasticache/) cache nodes for [Prometheus](https://prometheus.io/). **No address is defined by default**, it must be configured with relabeling and requires a [third-party exporter](https://prometheus.io/docs/instrumenting/exporters/#third-party-exporters) supporting the [multi-target pattern](https://prometheus.io/docs/guides/multi-target-exporter/).
 
@@ -10,9 +12,11 @@ ElastiCache SD allows retrieving scrape targets from [AWS ElastiCache](https://a
 
 Help on flags:
 
-```
+```shell
 ./prometheus-elasticache-sd --help
 ```
+
+This fork adds the `--elasticache.cache-cluster-id-pattern` flag. It only exposes clusters whose ID matches the given regular expression. The expression uses [regexp2](https://github.com/dlclark/regexp2) syntax, so lookarounds such as `(?!s[0-9]+-)` are supported.
 
 The following meta labels are available on targets during [relabeling](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config):
 
@@ -89,19 +93,25 @@ see its [README](https://github.com/prometheus/memcached_exporter#multi-target) 
 
 Binary:
 
-```
+```shell
 go build .
 ```
 
 Container image with [ko](https://ko.build):
 
-```
-ko build --base-import-paths --local .
+```shell
+KO_DEFAULTBASEIMAGE="$(grep -oPm 1 'base_image: \K.+' .goreleaser.yml)" \
+  KO_DOCKER_REPO=ko.local/maxbrunet/prometheus-elasticache-sd \
+  ko build \
+    --bare \
+    --image-user=nobody \
+    --tags="$(git describe --match='v*' --tags || git rev-parse --short HEAD)" \
+    .
 ```
 
 ### Test
 
-```
+```shell
 go test -v ./...
 ```
 

@@ -11,18 +11,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Prometheus Service Discovery for AWS ElastiCache
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"os"
-	"time"
-
 	"log/slog"
+	"net/http"
+	"net/http/pprof"
+	"os"
+	"strconv"
+	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -35,6 +37,7 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/dlclark/regexp2"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	versioncollector "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/model"
@@ -126,11 +129,11 @@ type ElasticacheDiscovery struct {
 func NewElasticacheDiscovery(conf *ElasticacheSDConfig, logger *slog.Logger, metrics discovery.DiscovererMetrics) (*ElasticacheDiscovery, error) {
 	m, ok := metrics.(*elasticacheMetrics)
 	if !ok {
-		return nil, fmt.Errorf("invalid discovery metrics type")
+		return nil, errors.New("invalid discovery metrics type")
 	}
 
 	if logger == nil {
-		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+		logger = promslog.NewNopLogger()
 	}
 
 	d := &ElasticacheDiscovery{
@@ -142,7 +145,7 @@ func NewElasticacheDiscovery(conf *ElasticacheSDConfig, logger *slog.Logger, met
 		refresh.Options{
 			Logger:              logger,
 			Mech:                "elasticache",
-			Interval:            time.Duration(d.cfg.RefreshInterval),
+			Interval:            d.cfg.RefreshInterval,
 			RefreshF:            d.refresh,
 			MetricsInstantiator: m.refreshMetrics,
 		},
@@ -184,6 +187,12 @@ func (d *ElasticacheDiscovery) elasticacheClient(ctx context.Context) (*elastica
 	return d.elasticache, nil
 }
 
+func setLabel(labels model.LabelSet, name model.LabelName, value *string) {
+	if value != nil {
+		labels[name] = model.LabelValue(*value)
+	}
+}
+
 func (d *ElasticacheDiscovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
 	elasticacheClient, err := d.elasticacheClient(ctx)
 	if err != nil {
@@ -204,8 +213,7 @@ func (d *ElasticacheDiscovery) refresh(ctx context.Context) ([]*targetgroup.Grou
 	for {
 		o, err := p.NextPage(ctx)
 		if err != nil {
-			var apiErr smithy.APIError
-			if errors.As(err, &apiErr) && (apiErr.ErrorCode() == "AuthFailure" || apiErr.ErrorCode() == "UnauthorizedOperation") {
+			if apiErr, ok := errors.AsType[smithy.APIError](err); ok && (apiErr.ErrorCode() == "AuthFailure" || apiErr.ErrorCode() == "UnauthorizedOperation") {
 				d.elasticache = nil
 			}
 
@@ -213,69 +221,84 @@ func (d *ElasticacheDiscovery) refresh(ctx context.Context) ([]*targetgroup.Grou
 		}
 
 		for _, cc := range o.CacheClusters {
-
 			if d.cfg.cacheClusterIDPattern != nil {
-				if stringMatch, _ := d.cfg.cacheClusterIDPattern.MatchString(*cc.CacheClusterId); !stringMatch {
-					d.logger.Info("skipping cluster", "cluster", *cc.CacheClusterId)
+				if match, _ := d.cfg.cacheClusterIDPattern.MatchString(aws.ToString(cc.CacheClusterId)); !match {
+					d.logger.Info("skipping cluster", "cluster", aws.ToString(cc.CacheClusterId))
 					continue
 				}
 			}
 
-			labels := model.LabelSet{
-				model.LabelName(ecLabelCacheClusterID):          model.LabelValue(*cc.CacheClusterId),
-				model.LabelName(ecLabelCacheClusterStatus):      model.LabelValue(*cc.CacheClusterStatus),
-				model.LabelName(ecLabelCacheNodeType):           model.LabelValue(*cc.CacheNodeType),
-				model.LabelName(ecLabelCacheParameterGroupName): model.LabelValue(*cc.CacheParameterGroup.CacheParameterGroupName),
-				model.LabelName(ecLabelCacheSubnetGroupName):    model.LabelValue(*cc.CacheSubnetGroupName),
-				model.LabelName(ecLabelEngine):                  model.LabelValue(*cc.Engine),
-				model.LabelName(ecLabelEngineVersion):           model.LabelValue(*cc.EngineVersion),
-				model.LabelName(ecLabelPreferredAZ):             model.LabelValue(*cc.PreferredAvailabilityZone),
+			// Every field below is optional in the ElastiCache API.
+			labels := make(model.LabelSet, 16)
+			setLabel(labels, ecLabelCacheClusterID, cc.CacheClusterId)
+			setLabel(labels, ecLabelCacheClusterStatus, cc.CacheClusterStatus)
+			setLabel(labels, ecLabelCacheNodeType, cc.CacheNodeType)
+			if cc.CacheParameterGroup != nil {
+				setLabel(labels, ecLabelCacheParameterGroupName, cc.CacheParameterGroup.CacheParameterGroupName)
 			}
+			setLabel(labels, ecLabelCacheSubnetGroupName, cc.CacheSubnetGroupName)
+			setLabel(labels, ecLabelEngine, cc.Engine)
+			setLabel(labels, ecLabelEngineVersion, cc.EngineVersion)
+			setLabel(labels, ecLabelPreferredAZ, cc.PreferredAvailabilityZone)
+			setLabel(labels, ecLabelReplicationGroupID, cc.ReplicationGroupId)
 
-			if cc.ReplicationGroupId != nil {
-				labels[model.LabelName(ecLabelReplicationGroupID)] = model.LabelValue(*cc.ReplicationGroupId)
-			}
-
+			resourceARN := aws.ToString(cc.ARN)
 			tags := []types.Tag{}
 
-			d.logger.Info("fetching tags for cluster", "cluster", *cc.CacheClusterId)
-			to, err := elasticacheClient.ListTagsForResource(ctx, &elasticache.ListTagsForResourceInput{
-				ResourceName: cc.ARN,
-			})
+			var to *elasticache.ListTagsForResourceOutput
+			var err error
+			if resourceARN != "" {
+				d.logger.Info("fetching tags for cluster", "cluster", aws.ToString(cc.CacheClusterId))
+				to, err = elasticacheClient.ListTagsForResource(ctx, &elasticache.ListTagsForResourceInput{
+					ResourceName: cc.ARN,
+				})
+			}
 			if err != nil {
-				d.logger.Warn("could not list tags", "err", err.Error(), "ARN", *cc.ARN, "status", *cc.CacheClusterStatus)
+				d.logger.Warn("could not list tags", "err", err.Error(), "ARN", resourceARN, "status", aws.ToString(cc.CacheClusterStatus))
 
 				// If a cache cluster is not in "available" status (e.g. "snapshotting"),
 				// its tags are unavailable, so if the relabeling logic depends on `__meta_elasticache_tag_<tagkey>` labels,
 				// the clusters may disappear from the Prometheus targets when that happens,
 				// thus we try to reuse the last tags we know about.
-				if _, ok := d.lastTags[*cc.ARN]; ok {
-					d.logger.Warn("reusing last known tags", "ARN", *cc.ARN)
-					tags = d.lastTags[*cc.ARN]
+				if last, ok := d.lastTags[resourceARN]; ok {
+					d.logger.Warn("reusing last known tags", "ARN", resourceARN)
+					tags = last
 				}
-			} else {
+			} else if to != nil {
 				tags = to.TagList
 			}
 
-			currentTags[*cc.ARN] = tags
+			if resourceARN != "" {
+				currentTags[resourceARN] = tags
+			}
 
 			for _, t := range tags {
+				if t.Key == nil || t.Value == nil {
+					continue
+				}
+
 				name := strutil.SanitizeLabelName(*t.Key)
 				labels[ecLabelTag+model.LabelName(name)] = model.LabelValue(*t.Value)
 			}
 
+			identity := cmp.Or(resourceARN, aws.ToString(cc.CacheClusterId))
+
 			for _, cn := range cc.CacheNodes {
 				nodeLabels := labels.Clone()
-				nodeLabels[model.LabelName(ecLabelCacheNodeID)] = model.LabelValue(*cn.CacheNodeId)
-				nodeLabels[model.LabelName(ecLabelCacheNodeStatus)] = model.LabelValue(*cn.CacheNodeStatus)
-				nodeLabels[model.LabelName(ecLabelCustomerAZ)] = model.LabelValue(*cn.CustomerAvailabilityZone)
-				nodeLabels[model.LabelName(ecLabelEndpointAddress)] = model.LabelValue(*cn.Endpoint.Address)
-				nodeLabels[model.LabelName(ecLabelEndpointPort)] = model.LabelValue(fmt.Sprintf("%d", *cn.Endpoint.Port))
+				setLabel(nodeLabels, ecLabelCacheNodeID, cn.CacheNodeId)
+				setLabel(nodeLabels, ecLabelCacheNodeStatus, cn.CacheNodeStatus)
+				setLabel(nodeLabels, ecLabelCustomerAZ, cn.CustomerAvailabilityZone)
+				if cn.Endpoint != nil {
+					setLabel(nodeLabels, ecLabelEndpointAddress, cn.Endpoint.Address)
+					if cn.Endpoint.Port != nil {
+						nodeLabels[model.LabelName(ecLabelEndpointPort)] = model.LabelValue(strconv.Itoa(int(*cn.Endpoint.Port)))
+					}
+				}
 
 				// Placeholder address
 				nodeLabels[model.AddressLabel] = model.LabelValue("undefined")
 
-				source := fmt.Sprintf("%s/%s", *cc.ARN, *cn.CacheNodeId)
+				source := fmt.Sprintf("%s/%s", identity, aws.ToString(cn.CacheNodeId))
 				d.logger.Debug("target added", "source", source)
 
 				current[source] = struct{}{}
@@ -312,36 +335,38 @@ func (d *ElasticacheDiscovery) refresh(ctx context.Context) ([]*targetgroup.Grou
 
 func main() {
 	var (
-		awsRegion                                 = kingpin.Flag("aws.region", "The AWS region. If not provided, the region from the default AWS credential chain is used.").String()
-		awsAccessKey                              = kingpin.Flag("aws.access-key", "The AWS Access Key. Must be provided with --aws.secret-key. If not provided, the credentials from the default AWS credential chain are used.").String()
-		awsSecretKey                              = kingpin.Flag("aws.secret-key", "The AWS Secret Key. Must be provided with --aws.access-key. If not provided, the credentials from the default AWS credential chain are used.").String()
-		awsProfile                                = kingpin.Flag("aws.profile", "Named AWS profile used to connect to the API.").String()
-		awsRoleARN                                = kingpin.Flag("aws.role-arn", "AWS Role ARN, an alternative to using AWS API keys.").String()
-		ecCacheClusterID                          = kingpin.Flag("elasticache.cache-cluster-id", "The user-supplied cluster identifier. If this parameter is specified, only information about that specific cluster is returned. This parameter isn't case sensitive.").String()
-		ecShowCacheClustersNotInReplicationGroups = kingpin.Flag("elasticache.show-cache-clusters-not-in-replication-groups", "An optional flag that can be included in the DescribeCacheCluster request to show only nodes (API/CLI: clusters) that are not members of a replication group. In practice, this means single node Redis clusters.").Bool()
-		targetRefreshInterval                     = kingpin.Flag("target.refresh-interval", "Refresh interval to re-read the cluster list.").Default("60s").Duration()
-		outputFile                                = kingpin.Flag("output.file", "The output filename for file_sd compatible file.").Default("elasticache.json").String()
-		webConfig                                 = webflag.AddFlags(kingpin.CommandLine, ":8888")
-		metricsPath                               = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
-		ecCacheClusterIDPattern                   = kingpin.Flag("elasticache.cache-cluster-id-pattern", "Pattern of the CacheClusterID that should be included.").String()
+		app                                       = kingpin.New("prometheus-elasticache-sd", "Prometheus ElastiCache Service Discovery")
+		awsRegion                                 = app.Flag("aws.region", "The AWS region. If not provided, the region from the default AWS credential chain is used.").String()
+		awsAccessKey                              = app.Flag("aws.access-key", "The AWS Access Key. Must be provided with --aws.secret-key. If not provided, the credentials from the default AWS credential chain are used.").String()
+		awsSecretKey                              = app.Flag("aws.secret-key", "The AWS Secret Key. Must be provided with --aws.access-key. If not provided, the credentials from the default AWS credential chain are used.").String()
+		awsProfile                                = app.Flag("aws.profile", "Named AWS profile used to connect to the API.").String()
+		awsRoleARN                                = app.Flag("aws.role-arn", "AWS Role ARN, an alternative to using AWS API keys.").String()
+		ecCacheClusterID                          = app.Flag("elasticache.cache-cluster-id", "The user-supplied cluster identifier. If this parameter is specified, only information about that specific cluster is returned. This parameter isn't case sensitive.").String()
+		ecShowCacheClustersNotInReplicationGroups = app.Flag("elasticache.show-cache-clusters-not-in-replication-groups", "An optional flag that can be included in the DescribeCacheCluster request to show only nodes (API/CLI: clusters) that are not members of a replication group. In practice, this means single node Redis clusters.").Bool()
+		targetRefreshInterval                     = app.Flag("target.refresh-interval", "Refresh interval to re-read the cluster list.").Default("60s").Duration()
+		outputFile                                = app.Flag("output.file", "The output filename for file_sd compatible file.").Default("elasticache.json").String()
+		webConfig                                 = webflag.AddFlags(app, ":8888")
+		metricsPath                               = app.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
+		ecCacheClusterIDPattern                   = app.Flag("elasticache.cache-cluster-id-pattern", "Pattern of the CacheClusterID that should be included.").String()
 	)
 
-	promlogConfig := &promslog.Config{}
+	promslogConfig := &promslog.Config{}
 
-	flag.AddFlags(kingpin.CommandLine, promlogConfig)
-	kingpin.Version(version.Print("prometheus-elasticache-sd"))
-	kingpin.HelpFlag.Short('h')
-	kingpin.Parse()
+	flag.AddFlags(app, promslogConfig)
+	app.Version(version.Print(app.Name))
+	app.HelpFlag.Short('h')
+	kingpin.MustParse(app.Parse(os.Args[1:]))
 
-	logger := promslog.New(promlogConfig)
+	logger := promslog.New(promslogConfig)
 
 	logger.Info("Starting prometheus-elasticache-sd", "version", version.Info())
 	logger.Info("Build context", "context", version.BuildContext())
 
 	var cacheClusterIDPattern *regexp2.Regexp
-	var err error
 
-	if ecCacheClusterIDPattern != nil {
+	if *ecCacheClusterIDPattern != "" {
+		var err error
+
 		cacheClusterIDPattern, err = regexp2.Compile(*ecCacheClusterIDPattern, 0)
 		if err != nil {
 			logger.Error("could not compile elasticache.cache-cluster-id-pattern", "err", err)
@@ -364,14 +389,19 @@ func main() {
 	discovery.RegisterConfig(conf)
 
 	reg := prometheus.NewRegistry()
-	refreshMetrics := discovery.NewRefreshMetrics(reg)
-	metrics, err := discovery.RegisterSDMetrics(reg, refreshMetrics)
+	reg.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		versioncollector.NewCollector("prometheus_elasticache_sd"),
+	)
+
+	sdMetrics, err := discovery.CreateAndRegisterSDMetrics(reg)
 	if err != nil {
-		logger.Error("failed to register service discovery metrics", "err", err)
+		logger.Error("failed to register the SD metrics", "err", err)
 		os.Exit(1)
 	}
 
-	discMetrics, ok := metrics[conf.Name()]
+	discMetrics, ok := sdMetrics.MechanismMetrics[conf.Name()]
 	if !ok {
 		logger.Error("discoverer metrics not registered")
 		os.Exit(1)
@@ -387,12 +417,15 @@ func main() {
 	}
 	ctx := context.Background()
 
-	sdAdapter := adapter.NewAdapter(ctx, *outputFile, "elasticache_sd", disc, logger, metrics, reg)
+	sdAdapter := adapter.NewAdapter(ctx, *outputFile, "elasticache_sd", disc, logger, sdMetrics, reg)
 	sdAdapter.Run()
 
-	prometheus.MustRegister(versioncollector.NewCollector("prometheus_elasticache_sd"))
-
-	http.Handle(*metricsPath, promhttp.Handler())
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+	mux.Handle("GET "+*metricsPath, promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	landingPage, err := web.NewLandingPage(web.LandingConfig{
 		Name:        "ElastiCache Service Discovery",
 		Description: "Prometheus ElastiCache Service Discovery",
@@ -408,9 +441,9 @@ func main() {
 		logger.Error("Error instantiating landing page", "err", err)
 		os.Exit(1)
 	}
-	http.Handle("/", landingPage)
+	mux.Handle("GET /", landingPage)
 
-	srv := &http.Server{}
+	srv := &http.Server{Handler: mux}
 
 	if err := web.ListenAndServe(srv, webConfig, logger); err != nil {
 		logger.Error("Error starting HTTP server", "err", err)

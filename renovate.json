@@ -6,7 +6,10 @@
     ":automergeMinor",
     ":rebaseStalePrs",
     ":semanticCommits",
-    ":semanticCommitScope(deps)"
+    ":semanticCommitScope(deps)",
+    "customManagers:githubActionsVersions",
+    "helpers:pinGitHubActionDigestsToSemver",
+    "security:gomodIndirectSecurityUpdates"
   ],
   "assignees": ["maxbrunet"],
   "internalChecksFilter": "strict",
@@ -17,12 +20,6 @@
       "description": "One week stability period for Go packages",
       "matchDatasources": ["go"],
       "minimumReleaseAge": "7 days"
-    },
-    {
-      "description": "Bump minimum Go version",
-      "matchManagers": ["gomod"],
-      "matchDepTypes": ["golang"],
-      "rangeStrategy": "replace"
     },
     {
       "description": "Group packages from aws-sdk-go-v2 monorepo together",
@@ -36,12 +33,6 @@
       "allowedVersions": "<1"
     },
     {
-      "description": "Customize golang updates commit message",
-      "matchDatasources": ["golang-version"],
-      "matchPackageNames": ["go"],
-      "commitMessageTopic": "Go"
-    },
-    {
       "matchDepTypes": ["require"],
       "semanticCommitType": "build"
     },
@@ -51,43 +42,45 @@
       "semanticCommitType": "build"
     },
     {
-      "matchPackageNames": ["quay.io/prometheus/busybox"],
+      "matchDepTypes": ["kos.base_image"],
       "semanticCommitType": "build"
     }
   ],
+  "customDatasources": {
+    "riscv-runners": {
+      "description": "RISE RISC-V runner labels track the ubuntu os-versions in the riscv-runner build matrix",
+      "defaultRegistryUrlTemplate": "https://raw.githubusercontent.com/riseproject-dev/riscv-runner/main/.github/workflows/deploy-runner.yml",
+      "format": "yaml",
+      "transformTemplates": [
+        "{'releases': jobs.`build-images`.strategy.matrix.include.{'version': `os-version` & '-riscv'}, 'sourceUrl': 'https://github.com/riseproject-dev/riscv-runner', 'homepage': 'https://riscv-runners.riseproject.dev/'}"
+      ]
+    }
+  },
   "customManagers": [
     {
-      "description": "Update version keys in YAML files",
-      "customType": "regex",
-      "fileMatch": ["(^|/).*.ya?ml$"],
-      "matchStrings": [
-        "# renovate: datasource=(?<datasource>[a-z-]+?) depName=(?<depName>[^\\s]+?)(?: packageName=(?<packageName>[^\\s]+?))?(?: versioning=(?<versioning>[a-z-0-9]+?))?\\s*[\\w-_]*version: (?<currentValue>.*?)\\s"
-      ]
-    },
-    {
       "description": "Update base image in .goreleaser.yml",
-      "customType": "regex",
-      "fileMatch": ["(^|/)\\.goreleaser\\.ya?ml$"],
+      "customType": "jsonata",
+      "fileFormat": "yaml",
+      "managerFilePatterns": ["/(^|/)\\.goreleaser\\.ya?ml$/"],
       "matchStrings": [
-        "base_image:\\s+[\"']?(?<depName>\\S+?)(?::(?<currentValue>\\S+?))?(?:@(?<currentDigest>sha256:\\S+))?[\"']?\\s"
+        "kos.$match(base_image, /^(.+?)(?::(.+?))?(?:@(sha256:.+))?$/).{ 'depName': groups[0], 'currentValue': groups[1], 'currentDigest': groups[2] }"
       ],
+      "autoReplaceStringTemplate": "{{#if (and currentDigest (equals currentValue newValue))}}{{newDigest}}{{else}}{{newValue}}{{#unless currentDigest}}{{#if newDigest}}@{{newDigest}}{{/if}}{{/unless}}{{/if}}",
       "datasourceTemplate": "docker",
+      "depTypeTemplate": "kos.base_image",
       "versioningTemplate": "docker"
     },
     {
-      "description": "Update Golang in .go-version file",
-      "customType": "regex",
-      "fileMatch": ["(^|/)\\.go-version$"],
-      "matchStrings": ["^\\s*(?<currentValue>.+?)\\s*$"],
-      "depNameTemplate": "go",
-      "datasourceTemplate": "golang-version"
-    },
-    {
-      "description": "Update semantic-release plugins",
-      "customType": "regex",
-      "fileMatch": ["^\\.github/workflows/build\\.yml$"],
-      "matchStrings": ["\\s{12}(?<depName>\\S+?)@(?<currentValue>.+?)\\s"],
-      "datasourceTemplate": "npm"
+      "description": "Update GitHub Actions runner labels in strategy.matrix runs-on",
+      "customType": "jsonata",
+      "fileFormat": "yaml",
+      "managerFilePatterns": ["/^\\.github/workflows/build\\.yml$/"],
+      "matchStrings": [
+        "jobs.test.strategy.matrix.`runs-on`[$match($, /^[a-z]+-[0-9]+\\.[0-9]+/)].{ 'depName': $substringBefore($, '-'), 'currentValue': $substringAfter($, '-') }"
+      ],
+      "datasourceTemplate": "{{#if (containsString currentValue \"-riscv\")}}custom.riscv-runners{{else}}github-runners{{/if}}",
+      "versioningTemplate": "docker",
+      "depTypeTemplate": "github-runner"
     }
   ]
 }
