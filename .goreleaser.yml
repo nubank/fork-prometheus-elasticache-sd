@@ -68,44 +68,78 @@ builds:
 archives:
   - &archive-default
     id: default
-    builds:
+    ids:
       - default
       - windows
     name_template: '{{ .ProjectName }}-{{ .Version }}.{{ .Os }}-{{ .Arch }}{{
       if .Arm }}v{{ .Arm }}{{ end }}{{ if and .Mips (ne .Mips "hardfloat") }}-{{
       .Mips }}{{ end }}'
-    format: tar.gz
+    builds_info:
+      group: root
+      owner: root
+      mtime: '{{ .CommitDate }}'
+    formats:
+      - tar.gz
     files:
-      - LICENSE
-      - NOTICE
+      - src: '{LICENSE,NOTICE}'
+        info:
+          owner: root
+          group: root
+          mtime: '{{ .CommitDate }}'
   - <<: *archive-default
     id: zip
-    builds:
+    ids:
       - windows
-    format: zip
+    formats:
+      - zip
 checksum:
   name_template: sha256sums.txt
 kos:
-  - id: default
-    repository: ghcr.io/maxbrunet/prometheus-elasticache-sd
+  - &ko-busybox
+    id: busybox
+    build: default
+    repositories:
+      - ghcr.io/maxbrunet/prometheus-elasticache-sd
+    local_domain: ko.local/maxbrunet/prometheus-elasticache-sd
     bare: true
     tags:
+      - '{{ .Tag }}-busybox'
       - '{{ .Tag }}'
+      - v2-busybox
+      - v2
       - latest
-    base_image: quay.io/prometheus/busybox@sha256:dfa54ef35e438b9e71ac5549159074576b6382f95ce1a434088e05fd6b730bc4
+    base_image: quay.io/prometheus/busybox:latest@sha256:7379672d53c28113469275f2eb48adffa19954f39f8ef20c1e2992278f658e6c
     creation_time: '{{ .CommitTimestamp }}'
     ko_data_creation_time: '{{ .CommitTimestamp }}'
-    labels:
-      org.opencontainers.image.licenses: Apache-2.0
+    labels: &labels-busybox
+      org.opencontainers.image.authors: Maxime Brunet,The Prometheus Authors
+      org.opencontainers.image.vendor: maxbrunet
+      org.opencontainers.image.title: prometheus-elasticache-sd
+      org.opencontainers.image.description: Prometheus Service Discovery for AWS ElastiCache
       org.opencontainers.image.source: https://github.com/maxbrunet/prometheus-elasticache-sd
       org.opencontainers.image.url: https://github.com/maxbrunet/prometheus-elasticache-sd
-    user: 1000:1000
+      org.opencontainers.image.documentation: https://github.com/maxbrunet/prometheus-elasticache-sd
+      org.opencontainers.image.licenses: Apache License 2.0
+      io.prometheus.image.variant: busybox
+    user: nobody
     platforms:
       - linux/amd64
       - linux/arm/v7
       - linux/arm64
       - linux/ppc64le
+      - linux/riscv64
       - linux/s390x
+  - <<: *ko-busybox
+    id: distroless
+    tags:
+      - '{{ .Tag }}-distroless'
+      - v2-distroless
+    base_image: gcr.io/distroless/static-debian13:nonroot@sha256:d62067879de890a1def9da0e7766b7d20810a5e5555cef8506b752437d7a3e88
+    labels:
+      <<: *labels-busybox
+      io.prometheus.image.variant: distroless
+    # Base image sets USER to 65532 (nonroot user).
+    user: null
 docker_signs:
   - artifacts: manifests
     cmd: cosign
